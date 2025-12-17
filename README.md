@@ -37,11 +37,11 @@ flowchart TB
         A5[Analytics Extractor]
     end
 
-    subgraph Storage["🗄️ Firestore + Object Storage"]
-        DB1[(users)]
-        DB2[(practiceSessions)]
-        DB3[(questionBank)]
-        DB4[(conversations)]
+    subgraph Storage["🗄️ Firestore + Qdrant + Object Storage"]
+        DB1[(Firestore: users)]
+        DB2[(Firestore: practiceSessions)]
+        DB3[(Qdrant: questionBank)]
+        DB4[(Firestore: conversations)]
         DB5[R2 Bucket - Attachments]
     end
 
@@ -65,7 +65,7 @@ flowchart TB
 | Agent | Responsibility | n8n Implementation |
 |-------|---------------|-------------------|
 | **Practice Chat Agent** | Accept topic, fetch questions, present cards, accept answers, request feedback | Main Webhook + Router Node |
-| **Question Fetcher & Variator** | Pull from question bank, create difficulty variants | Code Node + Firestore Query |
+| **Question Fetcher & Variator** | Pull from question bank, create difficulty variants | Code Node + **Qdrant Query** |
 | **Assessment Agent** | Evaluate answers, produce assessment summary, assign XP | AI Agent Node + Code Node |
 | **Reward Generator** | Calculate XP based on rules, save to DB | Code Node + Firestore Write |
 | **Analytics Extractor** | Read practice sessions, build topic analytics | Firestore Read + Code Node |
@@ -134,14 +134,15 @@ sequenceDiagram
     participant FE as Frontend
     participant N8N as Practice Chat Agent
     participant QF as Question Fetcher
+    participant QD as Qdrant
     participant FS as Firestore
 
     FE->>N8N: POST /practice/start<br/>{userId, topic, questionCount}
     N8N->>FS: Get user metadata<br/>(class, level, topicXP)
     FS-->>N8N: {class: "10", topicLevel: 3}
     N8N->>QF: Fetch questions for level 3
-    QF->>FS: Query questionBank<br/>filter by topic + difficulty
-    FS-->>QF: Raw questions
+    QF->>QD: Query Qdrant questionBank<br/>filter by topic + difficulty
+    QD-->>QF: Raw questions
     QF->>QF: Create variants based on level
     QF-->>N8N: Question bundle (5-10)
     N8N->>FS: Create practiceSession doc
@@ -492,22 +493,61 @@ function generateVariant(canonicalQuestion, targetDifficulty) {
 }
 ```
 
-### Collection: `questionBank/{questionId}`
+### Qdrant Collection: `questionBank`
+
+> [!IMPORTANT]
+> Questions are stored in **Qdrant vector database** with metadata filtering.
+
+#### Question Point Structure (Qdrant)
 ```json
 {
-  "questionId": "q1",
-  "canonicalId": "canon_12",
-  "topic": "Quadratic Equation",
-  "subTopic": "Solving by Factorization",
-  "text": "Solve x² - 5x + 6 = 0",
-  "type": "MCQ",
-  "options": ["1,2", "2,3", "-2,3", "none"],
-  "correctOption": 1,
-  "correctAnswer": "2,3",
-  "explanation": "Factor as (x-2)(x-3)=0, so x=2 or x=3",
-  "difficulty": "easy",
-  "createdBy": "teacher_xyz",
-  "createdAt": "2025-01-01T..."
+  "id": "q1",
+  "vector": [0.1, 0.2, ...],
+  "payload": {
+    "questionId": "q1",
+    "canonicalId": "canon_12",
+    "topic": "Quadratic Equation",
+    "subTopic": "Solving by Factorization",
+    "text": "Solve x² - 5x + 6 = 0",
+    "type": "MCQ",
+    "options": ["1,2", "2,3", "-2,3", "none"],
+    "correctOption": 1,
+    "correctAnswer": "2,3",
+    "explanation": "Factor as (x-2)(x-3)=0, so x=2 or x=3",
+    "difficulty": "easy",
+    "createdBy": "teacher_xyz"
+  }
+}
+```
+
+#### n8n Qdrant Query (Filter by Topic)
+```javascript
+// In n8n Qdrant Vector Store node or HTTP Request
+{
+  "collection_name": "questionBank",
+  "filter": {
+    "must": [
+      { "key": "topic", "match": { "value": "Quadratic Equation" } },
+      { "key": "difficulty", "match": { "value": "medium" } }
+    ]
+  },
+  "limit": 5,
+  "with_payload": true
+}
+```
+
+#### Alternative: Scroll API (no vector needed)
+```javascript
+// Use scroll if you don't need semantic search
+POST /collections/questionBank/points/scroll
+{
+  "filter": {
+    "must": [
+      { "key": "topic", "match": { "value": "Quadratic Equation" } }
+    ]
+  },
+  "limit": 10,
+  "with_payload": true
 }
 ```
 
@@ -546,7 +586,7 @@ flowchart LR
     A[Webhook Trigger<br/>POST /practice/start] --> B[Code: Parse Request]
     B --> C[Firestore: Get User<br/>class, topicXP, level]
     C --> D[Code: Determine<br/>Difficulty Level]
-    D --> E[Firestore: Query<br/>questionBank]
+    D --> E[Qdrant: Query<br/>questionBank by topic]
     E --> F[Code: Generate<br/>Question Variants]
     F --> G[Code: Remove Answers<br/>from Response]
     G --> H[Firestore: Create<br/>practiceSession doc]
@@ -560,7 +600,7 @@ flowchart LR
 | Parse Request | Code | Extract userId, topic, questionCount |
 | Get User | Firestore | Collection: `users`, Document: `{{ $json.userId }}` |
 | Determine Difficulty | Code | Map topicXP to level (500 XP = +1 level) |
-| Query Questions | Firestore | Collection: `questionBank`, Filter: topic + difficulty |
+| Query Questions | **Qdrant Vector Store** | Collection: `questionBank`, Filter: `topic` + `difficulty` metadata |
 | Generate Variants | Code | Apply variation rules based on level |
 | Remove Answers | Code | Delete correctOption, correctAnswer, explanation |
 | Create Session | Firestore | Collection: `practiceSessions`, Create doc |
@@ -573,7 +613,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     A[Webhook Trigger<br/>POST /practice/answer] --> B[Code: Parse Answer]
-    B --> C[Firestore: Get Question<br/>with correct answer]
+    B --> C[Qdrant: Get Question<br/>with correct answer]
     C --> D[Code: Compare Answer]
     D --> E{Is Correct?}
     E -->|Yes| F[Code: Calculate XP +20]
@@ -589,7 +629,7 @@ flowchart LR
 |------|------|---------------|
 | Webhook | Trigger | POST `/practice/answer` |
 | Parse Answer | Code | Extract sessionId, questionId, answer |
-| Get Question | Firestore | Collection: `questionBank`, Document: questionId |
+| Get Question | **Qdrant Vector Store** | Collection: `questionBank`, Point ID: questionId |
 | Compare Answer | Code | Check MCQ index, TF boolean, or text match |
 | Calculate XP | Code | Correct = 20 XP, Wrong = 0 |
 | Update Session | Firestore | Update answers array + xpAwarded |
@@ -684,7 +724,7 @@ function calculateLevel(topicXP) {
 ### ✅ Build First (Priority 1)
 
 1. **Practice Chat Agent Webhook** — accept topic, return questions
-2. **Question Fetcher** — query Firestore, basic variants
+2. **Question Fetcher** — query **Qdrant** by topic, basic variants
 3. **Answer Validation** — compare answers, calculate XP
 4. **Assessment Agent** — generate 4-5 line summary
 5. **Firestore Structure** — users, practiceSessions, questionBank
